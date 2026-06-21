@@ -32,7 +32,7 @@ st.markdown("""
 
 uploaded = st.file_uploader("Выберите файл", type=["csv", "xlsx", "xls"])
 
-example = """Пример запроса: найди корреляции между колонками и построй тепловую карту"""
+example = """пример запроса: найди корреляции между колонками и построй тепловую карту"""
 
 user_q = st.text_area("Ваш запрос",
                       placeholder=example, height=100)

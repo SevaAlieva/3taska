@@ -7,12 +7,14 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import matplotlib.pyplot as plt
 import seaborn as sns
+import re
 
 load_dotenv()
 client = OpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
     base_url="https://openrouter.ai/api/v1"
 )
+
 def safe_execute(code, df):
     dangerous = ['os.system', 'subprocess', '__import__', 'eval(', 'exec(', 'open(', 'rm ', 'del ', 'os.remove']
     for bad in dangerous:
@@ -43,10 +45,10 @@ def safe_execute(code, df):
     except Exception as e:
         return None, str(e)
 
-
 def analyze_data(df, user_text):
     if len(user_text) > 2000:
         return {"report": "слишком длинный запрос", "charts": None, "ok": False}
+
     dangerous_words = [
         "игнорируй", "ignore", "забудь", "forget", "отключи", "обойди",
         "удали файл", "rm -rf", "delete", "subprocess", "твоя роль",
@@ -56,6 +58,7 @@ def analyze_data(df, user_text):
     for word in dangerous_words:
         if word in user_text.lower():
             return {"report": f"обнаружено запрещенное слово: {word}", "charts": None, "ok": False}
+
     numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
     categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
 
@@ -69,72 +72,32 @@ def analyze_data(df, user_text):
 - категориальные колонки: {categorical_cols[:10]}
 {df.describe().to_string() if len(numeric_cols) > 0 else "нет числовых колонок"}
 """
-    prompt = f"""
+
+    all_charts = []
+    final_report = ""
+
+    eda_prompt = f"""
 Ты профессиональный AI-аналитик данных. Тебе предоставлен pandas DataFrame.
 {data_info}
-{'''дополнительный запрос пользователя:''' + user_text if user_text else '''нет дополнительного запроса. 
-Проведи полный анализ данных самостоятельно'''}
 
-Обязательная структура твоего ответа: если нет запроса пользователя,
-ты должен провести полный EDA анализ в следующем формате:
+Проведи первичный EDA-анализ данных. Определи:
+1. Основные характеристики датасета
+2. Качество данных (пропуски, дубликаты, выбросы)
+3. Базовые статистики
+4. Какие графики нужно построить для визуализации (максимум 2-3)
 
-1. общее описание датасета:
-- размер и структура
-- описание признаков
-- типы данных
+Верни ТОЛЬКО JSON в формате:
+{{"code": "код для графиков и анализа", "report": "краткий отчет по EDA"}}
 
-2. качество данных:
-- пропуски и как с ними быть
-- дубликаты
-- аномалии и выбросы
-
-3. основные статистики:
-- средние, медианы, стандартные отклонения
-- минимумы и максимумы
-- распределения значений
-
-4. корреляции и зависимости:
-- сильные корреляции (если есть числовые колонки)
-- взаимосвязи между признаками
-
-5. ответ на запрос пользователя
-
-6. итоговое выводы:
-- ключевые выводы
-- рекомендации
-
-Ты обязан сначала провести полный EDA-анализ датасета, а только потом
-отдельно ответить на дополнительный запрос пользователя.
-
-Правила создания графиков:
-1. создавай только действительно полезные графики (МАКСИМУМ ДО 4!)
-2. сохраняй графики в папку "charts/"
-3. используй осмысленные имена файлов
-4. разрешенные графики:
-   - тепловая карта корреляций (heatmap)
-   - гистограммы распределений (hist)
-   - boxplot для выбросов
-   - scatter plot для зависимостей
-5. для корреляций всегда используй df[numeric_cols].corr()
-6. для категориальных колонок не строй гистограммы
-
-Требования к коду:
-- импортируй: import matplotlib.pyplot as plt, import seaborn as sns
-- каждый график должен сопровождаться print() с пояснением
-- сохраняй графики: plt.savefig('charts/название.png')
-- закрывай фигуры: plt.close()
-
-Формат твоего ответа:
-Ты должен вернуть ТОЛЬКО JSON в формате:
-{{"code": "твой код", "report": "текстовый отчет"}}
+Обязательно импортируй matplotlib и seaborn в коде.
+Сохраняй графики в папку "charts/".
 """
-
     try:
         response = client.chat.completions.create(
-            model= "nvidia/nemotron-3-super-120b-a12b:free",
-            messages=[{"role": "user", "content": prompt}],
+            model="nvidia/nemotron-3-super-120b-a12b:free",
+            messages=[{"role": "user", "content": eda_prompt}],
             temperature=0.1,
-            max_tokens=4000
+            max_tokens=2000
         )
         content = response.choices[0].message.content
         if '```json' in content:
@@ -147,16 +110,94 @@ def analyze_data(df, user_text):
             end = content.rfind('}') + 1
             if start != -1 and end > start:
                 content = content[start:end]
+
         result = json.loads(content)
         code = result.get("code", "")
         report = result.get("report", "")
 
-        if not report:
-            report = "анализ выполнен успешно"
         charts, err = safe_execute(code, df)
         if err:
-            return {"report": f"ошибка выполнения: {err}", "charts": None, "ok": False}
-        return {"report": report, "charts": charts, "ok": True}
+            return {"report": f"ошибка выполнения EDA: {err}", "charts": None, "ok": False}
+
+        if charts:
+            all_charts.extend(charts)
+        final_report += f"## Шаг 1: Первичный EDA-анализ\n\n{report}\n\n"
+
+        if user_text and user_text.strip():
+            detailed_prompt = f"""
+Ты профессиональный AI-аналитик данных. 
+Результаты первичного EDA-анализа:
+{report}
+
+Теперь ответь на дополнительный запрос пользователя:
+{user_text}
+
+Проведи детальный анализ для ответа на этот запрос. Если нужно, построй дополнительные графики.
+Верни ТОЛЬКО JSON в формате:
+{{"code": "код для дополнительных графиков", "report": "детальный ответ на запрос"}}
+
+Сохраняй графики в папку "charts/" с новыми именами.
+"""
+            response2 = client.chat.completions.create(
+                model="nvidia/nemotron-3-super-120b-a12b:free",
+                messages=[{"role": "user", "content": detailed_prompt}],
+                temperature=0.1,
+                max_tokens=2000
+            )
+
+            content2 = response2.choices[0].message.content
+            if '```json' in content2:
+                content2 = content2.split('```json')[1].split('```')[0]
+            elif '```' in content2:
+                content2 = content2.split('```')[1].split('```')[0]
+            content2 = content2.strip()
+            if not content2.startswith('{'):
+                start = content2.find('{')
+                end = content2.rfind('}') + 1
+                if start != -1 and end > start:
+                    content2 = content2[start:end]
+
+            result2 = json.loads(content2)
+            code2 = result2.get("code", "")
+            report2 = result2.get("report", "")
+
+            charts2, err2 = safe_execute(code2, df)
+            if err2:
+                return {"report": f"ошибка выполнения детального анализа: {err2}", "charts": None, "ok": False}
+
+            if charts2:
+                all_charts.extend(charts2)
+            final_report += f"## Шаг 2: Детальный анализ по запросу\n\n{report2}\n\n"
+
+        if user_text and user_text.strip():
+            conclusion_prompt = f"""
+На основе проведенного анализа:
+EDA-анализ: {report}
+Ответ на запрос пользователя ({user_text}): {report2}
+
+Сформулируй итоговые выводы и рекомендации по данным.
+Ответ должен быть кратким и практичным.
+"""
+        else:
+            conclusion_prompt = f"""
+На основе проведенного EDA-анализа:
+{report}
+
+Сформулируй итоговые выводы и рекомендации по данным.
+Ответ должен быть кратким и практичным.
+"""
+
+        response3 = client.chat.completions.create(
+            model="nvidia/nemotron-3-super-120b-a12b:free",
+            messages=[{"role": "user", "content": conclusion_prompt}],
+            temperature=0.1,
+            max_tokens=1000
+        )
+
+        final_report += f"## Итоговые выводы\n\n{response3.choices[0].message.content}"
+
+        return {"report": final_report, "charts": all_charts, "ok": True}
+
     except json.JSONDecodeError as e:
         return {"report": f"ошибка формата JSON: {str(e)}", "charts": None, "ok": False}
     except Exception as e:
