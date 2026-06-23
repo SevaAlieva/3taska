@@ -1,64 +1,82 @@
 import os
 import pandas as pd
 import numpy as np
-import json
 import base64
+import re
+import io
+import sys
 from openai import OpenAI
 from dotenv import load_dotenv
 import matplotlib.pyplot as plt
 import seaborn as sns
-import re
 
 load_dotenv()
-client = OpenAI(
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-    base_url="https://openrouter.ai/api/v1"
-)
 
 def safe_execute(code, df):
     dangerous = ['os.system', 'subprocess', '__import__', 'eval(', 'exec(', 'open(', 'rm ', 'del ', 'os.remove']
     for bad in dangerous:
         if bad in code.lower():
             return None, f"обнаружен опасный код: {bad}"
-
-    os.makedirs("charts", exist_ok=True)
+    code = re.sub(r'^(\s*)(import |from )', r'\1# ', code, flags=re.MULTILINE)
     local_vars = {
-        "df": df,
+        "df": df.copy() if df is not None else None,
         "pd": pd,
         "np": np,
         "plt": plt,
         "sns": sns
     }
+    old_out = sys.stdout
+    sys.stdout = buf = io.StringIO()
+
     try:
         exec(code, local_vars)
-        charts = []
-        for file in os.listdir("charts"):
-            if file.endswith(('.png', '.jpg', '.jpeg')):
-                with open(os.path.join("charts", file), "rb") as f:
-                    charts.append({
-                        "name": file,
-                        "data": base64.b64encode(f.read()).decode()
-                    })
-                os.remove(os.path.join("charts", file))
+        output = buf.getvalue()
+        plot_data = None
+
+        if plt.gcf().get_axes():
+            bio = io.BytesIO()
+            plt.savefig(bio, format='png', bbox_inches='tight', dpi=100)
+            bio.seek(0)
+            plot_data = base64.b64encode(bio.read()).decode()
+            plt.close()
         plt.close('all')
-        return charts, None
+        return {"output": output, "plot_data": plot_data}, None
     except Exception as e:
         return None, str(e)
+    finally:
+        sys.stdout = old_out
 
-def analyze_data(df, user_text):
-    if len(user_text) > 2000:
+def call_llm(messages, api_key):
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1"
+    )
+    response = client.chat.completions.create(
+        model="nvidia/nemotron-3-super-120b-a12b:free",
+        messages=messages,
+        temperature=0.2,
+        max_tokens=4000
+    )
+    return response.choices[0].message.content
+
+def extract_code(text):
+    pattern = r'```python\s*(.*?)```'
+    match = re.search(pattern, text, re.DOTALL | re.I)
+    return match.group(1).strip() if match else None
+
+def analyze_data(df, user_text, api_key):
+    if user_text and len(user_text) > 2000:
         return {"report": "слишком длинный запрос", "charts": None, "ok": False}
 
     dangerous_words = [
         "игнорируй", "ignore", "забудь", "forget", "отключи", "обойди",
         "удали файл", "rm -rf", "delete", "subprocess", "твоя роль",
         "скачай", "отправь ключ", "send key", "отключи ограничения",
-        "выполни код", "os.system"
+        "os.system"
     ]
     for word in dangerous_words:
         if word in user_text.lower():
             return {"report": f"обнаружено запрещенное слово: {word}", "charts": None, "ok": False}
-
     numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
     categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
 
@@ -73,132 +91,82 @@ def analyze_data(df, user_text):
 {df.describe().to_string() if len(numeric_cols) > 0 else "нет числовых колонок"}
 """
 
+    system_prompt = f"""Ты — агент-аналитик данных. У тебя есть доступ к pandas DataFrame (переменная `df`).
+Информация о данных:
+{data_info}
+Ты можешь выполнять Python-код для анализа данных. Оберни код в блок ```python ... ```.
+После выполнения кода ты получишь результат и сможешь:
+1. Написать новый код для продолжения анализа
+2. Сформулировать финальный отчёт на основе полученных данных
+
+КРИТИЧЕСКИ ВАЖНО:
+- Делай выводы ТОЛЬКО на основе РЕАЛЬНЫХ данных из выполнения кода
+- НЕ пиши "вероятно", "можно предположить", "ожидается"
+- Используй КОНКРЕТНЫЕ ЧИСЛА: средние значения, корреляции, проценты
+- Если ты не выполнил код для получения данных — не делай выводов об этих данных
+- Отвечай ИСКЛЮЧИТЕЛЬНО на русском языке
+
+Правила:
+- Используй print() для вывода результатов
+- Для графиков используй plt.plot(), plt.bar(), plt.hist(), sns.heatmap() и т.д.
+- Не используй plt.show() - графики сохраняются автоматически
+- Не импортируй os, sys, subprocess и другие системные модули
+
+Работай итеративно: выполняй код, анализируй результаты, при необходимости выполняй ещё код.
+Когда у тебя будет достаточно информации для полного отчёта — просто напиши финальный отчёт БЕЗ блока кода."""
+
+    task = user_text if user_text and user_text.strip() else "Проведи полный EDA-анализ: статистика, визуализация, корреляции, инсайты."
+    conversation = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",
+         "content": f"Задача: {task}\n\nНачни анализ. Вызывай код через ```python ... ```, получай результаты и на их основе формируй выводы."}
+    ]
     all_charts = []
     final_report = ""
+    max_steps = 5
+    for step in range(max_steps):
+        try:
+            llm_response = call_llm(conversation, api_key)
+            conversation.append({"role": "assistant", "content": llm_response})
+            if len(conversation) > 9:
+                conversation = [conversation[0]] + conversation[-8:]
+            code = extract_code(llm_response)
 
-    eda_prompt = f"""
-Ты профессиональный AI-аналитик данных. Тебе предоставлен pandas DataFrame.
-{data_info}
-
-Проведи первичный EDA-анализ данных. Определи:
-1. Основные характеристики датасета
-2. Качество данных (пропуски, дубликаты, выбросы)
-3. Базовые статистики
-4. Какие графики нужно построить для визуализации (максимум 2-3)
-
-Верни ТОЛЬКО JSON в формате:
-{{"code": "код для графиков и анализа", "report": "краткий отчет по EDA"}}
-
-Обязательно импортируй matplotlib и seaborn в коде.
-Сохраняй графики в папку "charts/".
-"""
-    try:
-        response = client.chat.completions.create(
-            model="nvidia/nemotron-3-super-120b-a12b:free",
-            messages=[{"role": "user", "content": eda_prompt}],
-            temperature=0.1,
-            max_tokens=2000
-        )
-        content = response.choices[0].message.content
-        if '```json' in content:
-            content = content.split('```json')[1].split('```')[0]
-        elif '```' in content:
-            content = content.split('```')[1].split('```')[0]
-        content = content.strip()
-        if not content.startswith('{'):
-            start = content.find('{')
-            end = content.rfind('}') + 1
-            if start != -1 and end > start:
-                content = content[start:end]
-
-        result = json.loads(content)
-        code = result.get("code", "")
-        report = result.get("report", "")
-
-        charts, err = safe_execute(code, df)
-        if err:
-            return {"report": f"ошибка выполнения EDA: {err}", "charts": None, "ok": False}
-
-        if charts:
-            all_charts.extend(charts)
-        final_report += f"## Шаг 1: Первичный EDA-анализ\n\n{report}\n\n"
-
-        if user_text and user_text.strip():
-            detailed_prompt = f"""
-Ты профессиональный AI-аналитик данных. 
-Результаты первичного EDA-анализа:
-{report}
-
-Теперь ответь на дополнительный запрос пользователя:
-{user_text}
-
-Проведи детальный анализ для ответа на этот запрос. Если нужно, построй дополнительные графики.
-Верни ТОЛЬКО JSON в формате:
-{{"code": "код для дополнительных графиков", "report": "детальный ответ на запрос"}}
-
-Сохраняй графики в папку "charts/" с новыми именами.
-"""
-            response2 = client.chat.completions.create(
-                model="nvidia/nemotron-3-super-120b-a12b:free",
-                messages=[{"role": "user", "content": detailed_prompt}],
-                temperature=0.1,
-                max_tokens=2000
-            )
-
-            content2 = response2.choices[0].message.content
-            if '```json' in content2:
-                content2 = content2.split('```json')[1].split('```')[0]
-            elif '```' in content2:
-                content2 = content2.split('```')[1].split('```')[0]
-            content2 = content2.strip()
-            if not content2.startswith('{'):
-                start = content2.find('{')
-                end = content2.rfind('}') + 1
-                if start != -1 and end > start:
-                    content2 = content2[start:end]
-
-            result2 = json.loads(content2)
-            code2 = result2.get("code", "")
-            report2 = result2.get("report", "")
-
-            charts2, err2 = safe_execute(code2, df)
-            if err2:
-                return {"report": f"ошибка выполнения детального анализа: {err2}", "charts": None, "ok": False}
-
-            if charts2:
-                all_charts.extend(charts2)
-            final_report += f"## Шаг 2: Детальный анализ по запросу\n\n{report2}\n\n"
-
-        if user_text and user_text.strip():
-            conclusion_prompt = f"""
-На основе проведенного анализа:
-EDA-анализ: {report}
-Ответ на запрос пользователя ({user_text}): {report2}
-
-Сформулируй итоговые выводы и рекомендации по данным.
-Ответ должен быть кратким и практичным.
-"""
-        else:
-            conclusion_prompt = f"""
-На основе проведенного EDA-анализа:
-{report}
-
-Сформулируй итоговые выводы и рекомендации по данным.
-Ответ должен быть кратким и практичным.
-"""
-
-        response3 = client.chat.completions.create(
-            model="nvidia/nemotron-3-super-120b-a12b:free",
-            messages=[{"role": "user", "content": conclusion_prompt}],
-            temperature=0.1,
-            max_tokens=1000
-        )
-
-        final_report += f"## Итоговые выводы\n\n{response3.choices[0].message.content}"
-
-        return {"report": final_report, "charts": all_charts, "ok": True}
-
-    except json.JSONDecodeError as e:
-        return {"report": f"ошибка формата JSON: {str(e)}", "charts": None, "ok": False}
-    except Exception as e:
-        return {"report": f"ошибка: {str(e)}", "charts": None, "ok": False}
+            if code:
+                exec_result, err = safe_execute(code, df)
+                observation = ""
+                if err:
+                    observation = f"Ошибка выполнения кода: {err}"
+                else:
+                    observation = "Код успешно выполнен.\n"
+                    if exec_result["output"]:
+                        output_text = exec_result['output'][:2000]
+                        if len(exec_result['output']) > 2000:
+                            output_text += "\n... (вывод обрезан)"
+                        observation += f"Вывод:\n{output_text}\n"
+                    if exec_result["plot_data"]:
+                        all_charts.append({
+                            "name": f"chart_{len(all_charts) + 1}.png",
+                            "data": exec_result["plot_data"]
+                        })
+                        observation += f"График построен и сохранён (всего графиков: {len(all_charts)}).\n"
+                conversation.append({
+                    "role": "user",
+                    "content": f"Результат выполнения кода (шаг {step + 1}):\n{observation}\n\nПродолжай анализ или сформулируй финальный отчёт."
+                })
+            else:
+                final_report = llm_response
+                break
+        except Exception as e:
+            final_report = f"Ошибка в агентном цикле: {e}"
+            break
+    if not final_report:
+        conversation.append({
+            "role": "user",
+            "content": "Анализ завершён. Сформулируй итоговый отчёт на основе всех полученных данных. НЕ пиши больше код, только текстовый отчёт с выводами и инсайтами."
+        })
+        try:
+            final_report = call_llm(conversation, api_key)
+        except Exception as e:
+            final_report = f"Анализ завершён, но не удалось сформировать отчёт: {e}"
+    return {"report": final_report, "charts": all_charts, "ok": True}

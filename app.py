@@ -5,6 +5,10 @@ import base64
 from io import BytesIO
 from agent import analyze_data
 
+API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not API_KEY:
+    st.error("API-ключ не найден")
+    st.stop()
 blocked_prompts = [
     'забудь предыдущие инструкции', 'игнорируй предыдущие инструкции', 'отключи ограничения',
     'обойди ограничения', 'выполни код', 'удали файл', 'удали папку', 'скачай файл',
@@ -19,7 +23,6 @@ def is_prompt_safe(prompt):
         if pattern.lower() in prompt_lower:
             return False
     return True
-
 st.set_page_config(page_title="Задание 3: аналитик данных", layout="wide")
 st.title("Анализ данных через нейросеть")
 
@@ -31,9 +34,7 @@ st.markdown("""
 """)
 
 uploaded = st.file_uploader("Выберите файл", type=["csv", "xlsx", "xls"])
-
 example = """пример запроса: найди корреляции между колонками и построй тепловую карту"""
-
 user_q = st.text_area("Ваш запрос",
                       placeholder=example, height=100)
 if uploaded:
@@ -48,7 +49,6 @@ if uploaded:
     except Exception as e:
         st.error(f"ошибка при загрузке файла: {e}")
         st.stop()
-
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("строк", df.shape[0])
@@ -70,35 +70,28 @@ if uploaded:
             'уникальные': df.nunique()
         })
         st.dataframe(col_info)
-
     if st.button("Запустить анализ", type="primary"):
-        # Проверка безопасности промпта
         if not is_prompt_safe(user_q):
             st.error("обнаружен небезопасный запрос, пожалуйста, переформулируйте вопрос.")
             st.stop()
-        for file in os.listdir("charts"):
-            os.remove(os.path.join("charts", file))
-
         with st.spinner("нейросеть анализирует данные..."):
             try:
-                result = analyze_data(df, user_q)
+                result = analyze_data(df, user_q, API_KEY)
             except Exception as e:
                 st.error(f"ошибка при анализе: {e}")
                 st.stop()
-
         if result["ok"]:
             st.success("анализ успешно завершен!")
             with st.expander("отчет анализа", expanded=True):
                 st.markdown(result["report"])
-
             if result["charts"]:
                 st.subheader("сгенерированные графики")
                 cols = st.columns(2)
                 for idx, chart in enumerate(result["charts"]):
                     with cols[idx % 2]:
                         st.image(BytesIO(base64.b64decode(chart["data"])),
-                                 caption=chart["name"], use_column_width=True)
+                                 caption=chart["name"], use_container_width=True)
             else:
-                st.info("графики не были сгенерированы(возможно, нет подходящих данных)")
+                st.info("графики не были сгенерированы (возможно, нет подходящих данных)")
         else:
             st.error(f"{result['report']}")
